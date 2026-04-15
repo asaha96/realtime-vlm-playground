@@ -8,6 +8,9 @@ av>=11.0
 # JSON and data handling
 python-dotenv>=1.0
 
+# Audio transcription (instructor corrections → error signal)
+faster-whisper>=1.0
+
 # Optional: for testing and development
 pytest>=7.4
 pytest-cov>=4.1
