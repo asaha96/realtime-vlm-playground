@@ -51,6 +51,7 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/
+CLAUDE.md
 
 # ======= INTERNAL (Alcor Labs team only — NOT for candidates) =======
 internal/
@@ -59,3 +60,4 @@ internal/
 data/videos/
 data/videos_full/
 data/videos.zip
+data_videos/
