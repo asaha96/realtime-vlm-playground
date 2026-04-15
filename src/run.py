@@ -220,10 +220,10 @@ class StateTracker:
         self._last_error_t: float = -1e9
         # Index into self._steps of the currently expected step.
         self._current_idx: int = 0
-        # Sliding window of recent `done` readings (True/False) keyed to
-        # video timestamps; fires an advance when the window is dominated by
-        # True without requiring strict consecutivity.
-        self._done_window: List[bool] = []
+        # Video-time when we entered the current step.
+        self._current_idx_since_t: float = 0.0
+        # Sliding window of recent readings: (done, advance_by) tuples.
+        self._read_window: List[tuple] = []
         # Monotonic timestamp guard — VLM responses can return out-of-order at
         # speed>1 with multiple in-flight workers; we ignore stale observations.
         self._last_advance_t: float = -1e9
@@ -282,21 +282,19 @@ class StateTracker:
         Apply a VLM reading to the state machine. Returns a list of step_ids
         that were just marked completed at `video_t`.
 
-        Advance rules:
-          - advance_by >= 1 at confidence >= 0.70: complete current +
-            (advance_by - 1) intermediate steps in one go. A rate-limit
-            (MIN_ADVANCE_GAP) prevents the state from racing ahead on a
-            single model reading.
-          - done=True with confidence >= 0.60: accumulate in a sliding window
-            of 4; advance ONE step when >= 3 of last 4 are True. This
-            prevents single flickers from advancing prematurely.
-        Stale timestamps, low confidence, and finished procedures are no-ops.
+        Advance rules (primary signal = advance_by):
+          - require MIN_DWELL seconds in the current step before any advance
+            (prevents over-eager zero-to-N jumps),
+          - require >= 2 of last 3 readings to have advance_by >= 1 OR
+            current_step_done=True with confidence >= CONF_MIN,
+          - then advance by the max(advance_by) across the window (filling
+            intermediate skipped steps in a single emission).
         """
         CONF_MIN = 0.60
-        CONF_AHEAD = 0.70
         WIN = 3
         THRESHOLD = 2
-        MIN_ADVANCE_GAP = 4.0  # video-seconds between successive advances
+        MIN_DWELL = 4.0
+        MIN_ADVANCE_GAP = 3.0
         emitted: List[int] = []
         with self._lock:
             if video_t <= self._last_advance_t:
@@ -304,44 +302,47 @@ class StateTracker:
             if self._current_idx >= len(self._steps):
                 return emitted
 
-            gap_ok = (video_t - self._last_advance_t) >= MIN_ADVANCE_GAP
-
-            def _complete_n(n: int) -> None:
-                nonlocal emitted
-                n = min(n, len(self._steps) - self._current_idx)
-                for _ in range(n):
-                    step = self._steps[self._current_idx]
-                    if step.step_id not in self._completed_set:
-                        self._completed.append(step.step_id)
-                        self._completed_set.add(step.step_id)
-                        emitted.append(step.step_id)
-                    self._current_idx += 1
-                self._done_window.clear()
-                self._last_advance_t = video_t
-
-            if advance_by >= 1 and confidence >= CONF_AHEAD and gap_ok:
-                _complete_n(advance_by)
-                return emitted
-
             if confidence >= CONF_MIN:
-                self._done_window.append(bool(current_step_done))
-                if len(self._done_window) > WIN:
-                    self._done_window.pop(0)
+                self._read_window.append((bool(current_step_done), int(advance_by)))
+                if len(self._read_window) > WIN:
+                    self._read_window.pop(0)
 
-            if (
-                gap_ok
-                and sum(1 for d in self._done_window if d) >= THRESHOLD
-            ):
-                _complete_n(1)
+            dwell_ok = (video_t - self._current_idx_since_t) >= MIN_DWELL
+            gap_ok = (video_t - self._last_advance_t) >= MIN_ADVANCE_GAP
+            if not (dwell_ok and gap_ok):
                 return emitted
+
+            # How many readings suggest "move forward" (done OR advance_by>=1)?
+            positive = sum(
+                1 for (d, a) in self._read_window if d or a >= 1
+            )
+            if positive < THRESHOLD:
+                return emitted
+
+            # Pick the max advance_by in the window; floor at 1 if only done
+            # signals are present.
+            max_adv = max((a for (_, a) in self._read_window), default=0)
+            n = max(1, min(max_adv, len(self._steps) - self._current_idx))
+
+            for _ in range(n):
+                step = self._steps[self._current_idx]
+                if step.step_id not in self._completed_set:
+                    self._completed.append(step.step_id)
+                    self._completed_set.add(step.step_id)
+                    emitted.append(step.step_id)
+                self._current_idx += 1
+            self._current_idx_since_t = video_t
+            self._read_window.clear()
+            self._last_advance_t = video_t
             return emitted
 
     def finalize(self, video_t: float) -> List[int]:
         """
-        At end-of-video, emit completion for the currently-pending step IF
-        we have a non-trivial pending_done_count or the current_idx is the
-        very last step. This captures the last step which seldom produces
-        an advance transition.
+        At end-of-video, emit completion for the current pending step if it
+        is the LAST remaining step (the last step rarely produces a 'next
+        activity' transition, so a one-off finalize is worth the risk). We
+        do not fire finalize mid-procedure — a bad final emission would be
+        a precision hit with no corresponding GT match.
         """
         emitted: List[int] = []
         with self._lock:
@@ -350,10 +351,8 @@ class StateTracker:
             step = self._steps[self._current_idx]
             if step.step_id in self._completed_set:
                 return emitted
-            # Only finalize if we're on the LAST step (common end-of-video
-            # case where no next transition signal is possible).
             is_last = self._current_idx == len(self._steps) - 1
-            if not is_last and self._pending_done_count < 1:
+            if not is_last:
                 return emitted
             self._completed.append(step.step_id)
             self._completed_set.add(step.step_id)
@@ -466,13 +465,15 @@ class Pipeline:
             self._emit_step_by_id(sid, result, timestamp_sec)
 
         # Errors are costly when wrong (40% of the automated score) so we bias
-        # toward precision: require high confidence AND that the student is
-        # not merely ahead-of-schedule. Audio keywords still pick up errors
-        # we miss via video.
+        # toward precision: require near-certainty AND that the student is
+        # not merely ahead-of-schedule AND that the model wasn't signalling
+        # "done" in the same breath (the model sometimes flags "different
+        # from expected" as an error even when it's actually the next step).
         if (
             result.error_detected
             and result.advance_by == 0
-            and result.confidence >= 0.80
+            and not result.current_step_done
+            and result.confidence >= 0.90
         ):
             if self.state.accept_error(timestamp_sec):
                 self._emit_error(result, timestamp_sec, source="video")
@@ -524,6 +525,12 @@ class Pipeline:
 
     # -- audio -------------------------------------------------------------
 
+    # Suppress audio errors in the first N seconds — both training clips we
+    # inspected start with the instructor setting up ("no, I didn't say
+    # record..."), not correcting the student. GT never marks an error in
+    # this pre-action window.
+    AUDIO_ERROR_IGNORE_SEC = 10.0
+
     def on_audio(self, audio_bytes: bytes, start_sec: float, end_sec: float):
         if self.transcriber is None:
             return
@@ -544,6 +551,9 @@ class Pipeline:
 
         # One error per chunk is enough — take the earliest hit.
         hit = min(tx.hits, key=lambda h: h.segment_start)
+
+        if hit.segment_start < self.AUDIO_ERROR_IGNORE_SEC:
+            return
 
         # Ground truth errors are timestamped at the START of the wrong
         # action, which precedes the instructor's correction by ~2 s. Bias

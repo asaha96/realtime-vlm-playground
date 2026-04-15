@@ -21,17 +21,20 @@ from typing import List, Optional, Tuple
 
 
 CORRECTION_PATTERNS: List[re.Pattern] = [
-    re.compile(r"\bno\b", re.IGNORECASE),
+    re.compile(r"^\s*no[\s,.!?]", re.IGNORECASE),   # utterance starts with "no"
     re.compile(r"\bstop\b", re.IGNORECASE),
     re.compile(r"\bwait\b", re.IGNORECASE),
     re.compile(r"\bwrong\b", re.IGNORECASE),
     re.compile(r"\bdon'?t\b", re.IGNORECASE),
-    re.compile(r"\bnot (?:that|like|the)\b", re.IGNORECASE),
+    re.compile(r"\bnot (?:that|like|the|this)\b", re.IGNORECASE),
     re.compile(r"\bother one\b", re.IGNORECASE),
-    re.compile(r"\bdifferent\b", re.IGNORECASE),
     re.compile(r"\bhold on\b", re.IGNORECASE),
     re.compile(r"\bnope\b", re.IGNORECASE),
 ]
+
+# Instructor corrections are short imperative utterances. Filter out long
+# sentences where "no" / "stop" appear incidentally.
+MAX_KEYWORD_UTTERANCE_WORDS = 10
 
 
 @dataclass
@@ -107,6 +110,12 @@ class Transcriber:
                     continue
                 segments.append((seg_start, seg_end, text))
                 pieces.append(text)
+                # Only treat the keyword as a correction if the utterance is
+                # short and imperative-looking; otherwise "no" in casual
+                # speech produces false positives on clips without real
+                # errors.
+                if len(text.split()) > MAX_KEYWORD_UTTERANCE_WORDS:
+                    continue
                 for pat in CORRECTION_PATTERNS:
                     m = pat.search(text)
                     if m:
