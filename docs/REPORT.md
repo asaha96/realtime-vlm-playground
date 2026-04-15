@@ -89,17 +89,35 @@ noise from the cheaper model.
 
 ## Measured results (speed=1.0, tolerance ±5 s)
 
-| Clip | step F1 | err F1 | mean latency |
-|---|---|---|---|
-| R066 circuit-breaker | 0.45 | 0.18 | 1.9 s |
-| R073 GoPro | 0.25 | — | 1.9 s |
-| R142 RAM | 0.08 | — | 2.0 s |
+Latest single-run numbers on three representative clips:
 
-The combined score on R066 is ≈ 0.42 (0.40·0.45 + 0.40·0.18 + 0.20·0.81).
+| Clip | steps matched | step F1 | err F1 | mean latency |
+|---|---|---|---|---|
+| R066 circuit-breaker | 1/11 – 5/11 | 0.09–0.45 | 0.18–0.22 | 1.5–1.9 s |
+| R073 GoPro | 1/11 – 2/11 | 0.13–0.25 | — | 1.7–2.0 s |
+| R142 RAM | 1/13 – 5/13 | 0.08–0.39 | — | 1.8–2.0 s |
+
+Ranges reflect run-to-run variance — the state machine's sliding-window
+advance rule is sensitive to which specific frames the motion gate picks
+and how close to the GT end the model's first "done" reading lands. A
+handful of steps matching is common; occasional 0-match runs happen when
+the model skips an advance signal on the transition frame.
+
 Latency scores are consistently >0.8 because VLM calls complete in ~2 s
 at 1x and we timestamp emissions at the **frame timestamp** (not
 response-arrival wall time), so the harness' `detection_delay` measures
 only the API round-trip.
+
+### Variance mitigations I considered but did not ship
+
+* Multiple samples per nominal frame with median-vote on the response —
+  doubles cost.
+* Escalation to Gemini 2.5 Pro or Claude Sonnet on ambiguous frames —
+  5-10× cost for small accuracy gains on a task where the single-frame
+  bottleneck dominates.
+* An "expected duration" prior per step derived from procedure length —
+  would require per-procedure priors and was out of scope for a
+  7-day submission.
 
 ### Where accuracy is lost
 
