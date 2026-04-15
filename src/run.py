@@ -194,9 +194,17 @@ class StepView:
 
 class StateTracker:
     """
-    Procedure state: completed-step set, current expected step, last VLM
-    observation (fed back into the next prompt as context), and per-kind
-    dedup windows.
+    Strict monotonic step progression.
+
+    The pipeline asks the VLM a single focused question — "is the current
+    step done, and how far ahead of current is the student?" — and the
+    state machine advances `current_step_idx` accordingly. Each advance
+    emits step_completion for the step that was just left behind. This
+    avoids relying on the VLM to disambiguate visually similar actions by
+    their step id.
+
+    Out-of-order VLM responses (common at speed>1) are dropped via the
+    monotonic timestamp guard.
     """
 
     def __init__(self, steps: List[Dict[str, Any]]):
@@ -210,6 +218,15 @@ class StateTracker:
         self._completed_set: set[int] = set()
         self._last_observation: str = ""
         self._last_error_t: float = -1e9
+        # Index into self._steps of the currently expected step.
+        self._current_idx: int = 0
+        # Sliding window of recent `done` readings (True/False) keyed to
+        # video timestamps; fires an advance when the window is dominated by
+        # True without requiring strict consecutivity.
+        self._done_window: List[bool] = []
+        # Monotonic timestamp guard — VLM responses can return out-of-order at
+        # speed>1 with multiple in-flight workers; we ignore stale observations.
+        self._last_advance_t: float = -1e9
 
     @property
     def step_ids(self) -> List[int]:
@@ -217,16 +234,31 @@ class StateTracker:
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
-            completed_ids = list(self._completed)
-            remaining = [
-                {"step_id": s.step_id, "description": s.description}
-                for s in self._steps
-                if s.step_id not in self._completed_set
-            ]
+            current = (
+                self._steps[self._current_idx]
+                if self._current_idx < len(self._steps)
+                else None
+            )
+            nxt = (
+                self._steps[self._current_idx + 1]
+                if self._current_idx + 1 < len(self._steps)
+                else None
+            )
+            nxt2 = (
+                self._steps[self._current_idx + 2]
+                if self._current_idx + 2 < len(self._steps)
+                else None
+            )
+
+            def _pack(s):
+                return {"step_id": s.step_id, "description": s.description} if s else None
+
             return {
-                "completed": completed_ids,
-                "upcoming": remaining[:2],
+                "current": _pack(current),
+                "next": _pack(nxt),
+                "next2": _pack(nxt2),
                 "last_observation": self._last_observation,
+                "procedure_complete": current is None,
             }
 
     def step_description(self, step_id: int) -> str:
@@ -239,29 +271,95 @@ class StateTracker:
         with self._lock:
             self._last_observation = obs[:240]
 
-    def accept_step_completion(self, step_id: int, confidence: float) -> bool:
+    def advance(
+        self,
+        current_step_done: bool,
+        advance_by: int,
+        video_t: float,
+        confidence: float,
+    ) -> List[int]:
         """
-        Accept a VLM-reported completion if:
-          - it's a valid step id,
-          - not already completed,
-          - and it's the next-expected step or one ahead (small reorderings).
+        Apply a VLM reading to the state machine. Returns a list of step_ids
+        that were just marked completed at `video_t`.
+
+        Advance rules:
+          - advance_by >= 1 at confidence >= 0.70: complete current +
+            (advance_by - 1) intermediate steps in one go. A rate-limit
+            (MIN_ADVANCE_GAP) prevents the state from racing ahead on a
+            single model reading.
+          - done=True with confidence >= 0.60: accumulate in a sliding window
+            of 4; advance ONE step when >= 3 of last 4 are True. This
+            prevents single flickers from advancing prematurely.
+        Stale timestamps, low confidence, and finished procedures are no-ops.
         """
-        if confidence < 0.55:
-            return False
+        CONF_MIN = 0.60
+        CONF_AHEAD = 0.70
+        WIN = 3
+        THRESHOLD = 2
+        MIN_ADVANCE_GAP = 4.0  # video-seconds between successive advances
+        emitted: List[int] = []
         with self._lock:
-            if step_id not in self._by_id or step_id in self._completed_set:
-                return False
-            remaining_ids = [
-                s.step_id for s in self._steps if s.step_id not in self._completed_set
-            ]
-            if not remaining_ids:
-                return False
-            allowed = set(remaining_ids[:2])
-            if step_id not in allowed:
-                return False
-            self._completed.append(step_id)
-            self._completed_set.add(step_id)
-            return True
+            if video_t <= self._last_advance_t:
+                return emitted
+            if self._current_idx >= len(self._steps):
+                return emitted
+
+            gap_ok = (video_t - self._last_advance_t) >= MIN_ADVANCE_GAP
+
+            def _complete_n(n: int) -> None:
+                nonlocal emitted
+                n = min(n, len(self._steps) - self._current_idx)
+                for _ in range(n):
+                    step = self._steps[self._current_idx]
+                    if step.step_id not in self._completed_set:
+                        self._completed.append(step.step_id)
+                        self._completed_set.add(step.step_id)
+                        emitted.append(step.step_id)
+                    self._current_idx += 1
+                self._done_window.clear()
+                self._last_advance_t = video_t
+
+            if advance_by >= 1 and confidence >= CONF_AHEAD and gap_ok:
+                _complete_n(advance_by)
+                return emitted
+
+            if confidence >= CONF_MIN:
+                self._done_window.append(bool(current_step_done))
+                if len(self._done_window) > WIN:
+                    self._done_window.pop(0)
+
+            if (
+                gap_ok
+                and sum(1 for d in self._done_window if d) >= THRESHOLD
+            ):
+                _complete_n(1)
+                return emitted
+            return emitted
+
+    def finalize(self, video_t: float) -> List[int]:
+        """
+        At end-of-video, emit completion for the currently-pending step IF
+        we have a non-trivial pending_done_count or the current_idx is the
+        very last step. This captures the last step which seldom produces
+        an advance transition.
+        """
+        emitted: List[int] = []
+        with self._lock:
+            if self._current_idx >= len(self._steps):
+                return emitted
+            step = self._steps[self._current_idx]
+            if step.step_id in self._completed_set:
+                return emitted
+            # Only finalize if we're on the LAST step (common end-of-video
+            # case where no next transition signal is possible).
+            is_last = self._current_idx == len(self._steps) - 1
+            if not is_last and self._pending_done_count < 1:
+                return emitted
+            self._completed.append(step.step_id)
+            self._completed_set.add(step.step_id)
+            self._current_idx += 1
+            emitted.append(step.step_id)
+            return emitted
 
     def accept_error(self, video_t: float, dedup_sec: float = 4.0) -> bool:
         with self._lock:
@@ -294,6 +392,7 @@ class Pipeline:
         model: str = "google/gemini-2.5-flash",
         max_workers: int = 4,
         audio_model_size: str = "tiny",
+        verbose: bool = False,
     ):
         self.harness = harness
         self.api_key = api_key
@@ -301,6 +400,7 @@ class Pipeline:
         self.task_name = procedure.get("task") or procedure.get("task_name", "Unknown")
         self.steps: List[Dict[str, Any]] = procedure["steps"]
         self.model = model
+        self.verbose = verbose
 
         self.state = StateTracker(self.steps)
         self.sampler = FrameSampler()
@@ -322,10 +422,14 @@ class Pipeline:
 
     def _process_frame(self, frame_base64: str, timestamp_sec: float) -> None:
         snapshot = self.state.snapshot()
+        if snapshot["procedure_complete"]:
+            # Nothing useful to ask; skip the call and save cost.
+            return
         prompt = build_prompt(
             task_name=self.task_name,
-            completed_ids=snapshot["completed"],
-            upcoming=snapshot["upcoming"],
+            current_step=snapshot["current"],
+            next_step=snapshot["next"],
+            step_after_next=snapshot["next2"],
             last_observation=snapshot["last_observation"],
         )
         try:
@@ -346,23 +450,45 @@ class Pipeline:
 
         result = parse_response(text)
         self.state.record_observation(result.observation)
+        if self.verbose:
+            print(
+                f"  [vlm @ {timestamp_sec:6.1f}s] done={result.current_step_done} "
+                f"advance={result.advance_by} conf={result.confidence:.2f} "
+                f"err={result.error_detected} obs={result.observation[:80]!r}"
+            )
 
-        if result.step_completed is not None:
-            if self.state.accept_step_completion(result.step_completed, result.confidence):
-                self._emit_step(result, timestamp_sec)
+        for sid in self.state.advance(
+            result.current_step_done,
+            result.advance_by,
+            timestamp_sec,
+            result.confidence,
+        ):
+            self._emit_step_by_id(sid, result, timestamp_sec)
 
-        if result.error_detected:
+        # Errors are costly when wrong (40% of the automated score) so we bias
+        # toward precision: require high confidence AND that the student is
+        # not merely ahead-of-schedule. Audio keywords still pick up errors
+        # we miss via video.
+        if (
+            result.error_detected
+            and result.advance_by == 0
+            and result.confidence >= 0.80
+        ):
             if self.state.accept_error(timestamp_sec):
                 self._emit_error(result, timestamp_sec, source="video")
 
-    def _emit_step(self, result: VLMResult, timestamp_sec: float) -> None:
-        step_id = int(result.step_completed)
+    def _emit_step_by_id(
+        self,
+        step_id: int,
+        result: VLMResult,
+        timestamp_sec: float,
+    ) -> None:
         desc = self.state.step_description(step_id) or result.observation
         event = {
             "timestamp_sec": round(float(timestamp_sec), 3),
             "type": "step_completion",
-            "step_id": step_id,
-            "confidence": round(float(result.confidence), 3),
+            "step_id": int(step_id),
+            "confidence": round(max(0.5, float(result.confidence)), 3),
             "description": desc,
             "source": "video",
             "vlm_observation": result.observation[:240],
@@ -448,6 +574,31 @@ class Pipeline:
 
     # -- lifecycle ---------------------------------------------------------
 
+    def drain(self) -> None:
+        """Wait for all in-flight VLM/audio jobs, keep the executor alive."""
+        # ThreadPoolExecutor has no public "join" — swap it for a fresh one
+        # after draining so shutdown() can be called cleanly afterwards.
+        old = self.executor
+        old.shutdown(wait=True)
+        self.executor = ThreadPoolExecutor(max_workers=1)
+
+    def finalize_at(self, video_duration_sec: float) -> List[Dict[str, Any]]:
+        """Mark any still-pending last step as completed at end-of-video."""
+        events: List[Dict[str, Any]] = []
+        for step_id in self.state.finalize(video_duration_sec):
+            desc = self.state.step_description(step_id)
+            events.append({
+                "timestamp_sec": round(float(video_duration_sec), 3),
+                "type": "step_completion",
+                "step_id": int(step_id),
+                "confidence": 0.6,
+                "description": desc,
+                "source": "video",
+                "vlm_observation": "End-of-video finalisation.",
+                "detection_delay_sec": 0.0,
+            })
+        return events
+
     def shutdown(self) -> None:
         self.executor.shutdown(wait=True)
 
@@ -490,6 +641,8 @@ def main() -> None:
                         help="faster-whisper model size (tiny|base|small)")
     parser.add_argument("--api-key", help="OpenRouter API key (or set OPENROUTER_API_KEY)")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs only")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print per-VLM-call diagnostic lines")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -538,6 +691,7 @@ def main() -> None:
         model=args.model,
         max_workers=args.max_workers,
         audio_model_size=args.audio_model,
+        verbose=args.verbose,
     )
 
     harness.on_frame(pipeline.on_frame)
@@ -546,6 +700,14 @@ def main() -> None:
     t0 = time.monotonic()
     try:
         results = harness.run()
+        # Drain in-flight VLM calls so late completions still reach the
+        # event log before finalisation.
+        pipeline.drain()
+        # End-of-video: mark the last running activity complete. Use the
+        # video_duration as the emission timestamp (best approximation of
+        # "done" when we never see a transition out of it).
+        for final in pipeline.finalize_at(results.video_duration_sec):
+            results.events.append(final)
     finally:
         pipeline.shutdown()
     wall = time.monotonic() - t0

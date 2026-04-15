@@ -27,7 +27,8 @@ VALID_ERROR_TYPES = {
 @dataclass
 class VLMResult:
     observation: str = ""
-    step_completed: Optional[int] = None
+    current_step_done: bool = False
+    advance_by: int = 0  # how many steps ahead the student appears to be
     error_detected: bool = False
     error_type: str = "other"
     error_description: str = ""
@@ -38,43 +39,55 @@ class VLMResult:
 
 def build_prompt(
     task_name: str,
-    completed_ids: List[int],
-    upcoming: List[Dict[str, Any]],
+    current_step: Optional[Dict[str, Any]],
+    next_step: Optional[Dict[str, Any]],
+    step_after_next: Optional[Dict[str, Any]],
     last_observation: str,
 ) -> str:
     """
-    Build the per-frame prompt. `upcoming` is the next 1-3 expected steps
-    (already trimmed by the caller) — we show the next two at most to keep
-    tokens low.
-    """
-    next1 = upcoming[0] if upcoming else None
-    next2 = upcoming[1] if len(upcoming) > 1 else None
+    Ask the VLM a targeted question anchored at a single current step.
 
-    completed_str = (
-        ", ".join(str(i) for i in completed_ids[-4:]) if completed_ids else "none"
+    Instead of "identify which of N steps is happening" (unreliable from
+    single frames), we ask the more tractable pair:
+      - Is the current step finished?
+      - Is the student already working on a later step (skipped ahead)?
+    The orchestrator advances the state machine based on the answers.
+    """
+    cur = (
+        f"[{current_step['step_id']}] {current_step['description']}"
+        if current_step
+        else "(procedure already complete — no current step)"
     )
-    next1_str = (
-        f"[{next1['step_id']}] {next1['description']}"
-        if next1
-        else "none (procedure complete)"
+    nxt = (
+        f"[{next_step['step_id']}] {next_step['description']}"
+        if next_step
+        else "(none — no step after current)"
     )
-    next2_str = (
-        f"[{next2['step_id']}] {next2['description']}" if next2 else "none"
+    nxt2 = (
+        f"[{step_after_next['step_id']}] {step_after_next['description']}"
+        if step_after_next
+        else "(none)"
     )
     last_obs_str = last_observation.strip() or "none"
 
     return (
         f"You are a real-time assistant watching a technician perform: {task_name}.\n"
-        f"Recently completed step ids: {completed_str}.\n"
-        f"Expected NEXT step: {next1_str}\n"
-        f"The step AFTER that:  {next2_str}\n"
+        "\n"
+        f"CURRENT expected step: {cur}\n"
+        f"NEXT step (after current): {nxt}\n"
+        f"STEP AFTER NEXT: {nxt2}\n"
         f"Previous observation: {last_obs_str}\n"
         "\n"
-        "Look at this frame and respond with ONE JSON object and nothing else. "
-        "Schema:\n"
+        "Respond with ONE JSON object and nothing else:\n"
         "{\n"
         '  "observation": "<one short sentence describing what the person is doing now>",\n'
-        '  "step_completed": <step_id that JUST finished in this frame, or null>,\n'
+        '  "current_step_done": <true if the CURRENT step has been completed (its '
+        "terminal state is visible, or the student is now clearly moving on to a later "
+        'action), else false>,\n'
+        '  "advance_by": <integer 0-3: how many steps ahead of CURRENT the student '
+        "appears to be doing right now. 0 = still on CURRENT (or idle/transitioning), "
+        "1 = doing NEXT, 2 = doing STEP AFTER NEXT, 3 = skipped even further. If unsure, "
+        'return 0>,\n'
         '  "error": {\n'
         '    "detected": <true|false>,\n'
         '    "type": "wrong_action|wrong_sequence|safety_violation|improper_technique|other",\n'
@@ -83,10 +96,19 @@ def build_prompt(
         "  },\n"
         '  "confidence": <0.0..1.0>\n'
         "}\n"
-        "Rules: only set step_completed when the action for that step is clearly "
-        "finished in THIS frame. Do not repeat a step id that is already in the "
-        "completed list. Only flag an error if the person is clearly doing "
-        "something wrong for the expected next step."
+        "\n"
+        "Guidance:\n"
+        "- current_step_done: set true when the physical action of the CURRENT step is "
+        "visibly finished (terminal state present in the frame) OR when the student has "
+        "clearly moved on to the NEXT / later action. Otherwise false. Do NOT set true on "
+        "purely mid-action frames.\n"
+        "- advance_by: your reading of how far ahead of CURRENT the student has moved. "
+        "If current_step_done=false and the student is on CURRENT, return 0. If they're "
+        "now on NEXT, return 1. Skipping ahead without completing CURRENT is allowed; "
+        "the orchestrator will fill in the gaps.\n"
+        "- error.detected: true only for clear mistakes (wrong tool, wrong object, unsafe "
+        "action, damage). Being between two steps is NOT an error.\n"
+        "- confidence: your certainty the JSON above is correct."
     )
 
 
@@ -111,11 +133,12 @@ def parse_response(text: str) -> VLMResult:
         return result
 
     result.observation = str(data.get("observation", "")).strip()
-    sc = data.get("step_completed")
-    if isinstance(sc, int):
-        result.step_completed = sc
-    elif isinstance(sc, str) and sc.strip().isdigit():
-        result.step_completed = int(sc.strip())
+    result.current_step_done = bool(data.get("current_step_done", False))
+    ab = data.get("advance_by", 0)
+    try:
+        result.advance_by = max(0, min(3, int(ab)))
+    except (TypeError, ValueError):
+        result.advance_by = 0
 
     err = data.get("error") or {}
     if isinstance(err, dict):
