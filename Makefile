@@ -33,14 +33,16 @@ install:
 # Override these when running:
 #   make run VIDEO=data/videos_full/CLIP/Export_py/Video_pitchshift.mp4 PROCEDURE=data/clip_procedures/CLIP.json
 PROCEDURE ?= data/clip_procedures/R066-15July-Circuit-Breaker-part2.json
-VIDEO ?= data/videos_full/R066-15July-Circuit-Breaker-part2/Export_py/Video_pitchshift.mp4
+VIDEO ?= data_videos/videos_full/R066-15July-Circuit-Breaker-part2/Export_py/Video_pitchshift.mp4
 OUTPUT ?= output/events.json
+SPEED ?= 1.0
 
 run:
 	python src/run.py \
 		--procedure $(PROCEDURE) \
 		--video $(VIDEO) \
-		--output $(OUTPUT)
+		--output $(OUTPUT) \
+		--speed $(SPEED)
 
 dry-run:
 	python src/run.py \
