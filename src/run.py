@@ -54,33 +54,35 @@ def call_vlm(
     max_tokens: int = 220,
     temperature: float = 0.1,
     timeout: float = 30.0,
+    extra_images: Optional[List[str]] = None,
 ) -> str:
-    """Call a VLM on OpenRouter and return the response text."""
+    """Call a VLM on OpenRouter and return the response text.
+
+    If `extra_images` is provided, they are prepended before `frame_base64`
+    in the message so the model sees them left-to-right (earlier → latest).
+    """
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "HTTP-Referer": "https://github.com/alcor-labs/vlm-orchestrator-eval",
         "X-Title": "VLM Orchestrator Evaluation",
     }
+    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for img_b64 in extra_images or []:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+        })
+    content.append({
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{frame_base64}"},
+    })
     payload = {
         "model": model,
         "stream": stream,
         "max_tokens": max_tokens,
         "temperature": temperature,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{frame_base64}"
-                        },
-                    },
-                ],
-            }
-        ],
+        "messages": [{"role": "user", "content": content}],
     }
 
     if stream:
@@ -406,6 +408,13 @@ class Pipeline:
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.transcriber = load_transcriber(model_size=audio_model_size)
 
+        # Frame history: keep the last N sampled frames so each VLM call
+        # gets temporal context (the model can compare earlier and later
+        # frames to detect transitions).
+        self._frame_history_lock = threading.Lock()
+        self._frame_history: List[tuple] = []  # [(timestamp, base64), ...]
+        self.FRAME_HISTORY_SIZE = 2  # send current + 2 previous
+
         # Stats
         self._stats_lock = threading.Lock()
         self.api_calls = 0
@@ -417,20 +426,41 @@ class Pipeline:
     def on_frame(self, frame: np.ndarray, timestamp_sec: float, frame_base64: str):
         if not self.sampler.should_sample(frame, timestamp_sec):
             return
-        self.executor.submit(self._process_frame, frame_base64, timestamp_sec)
+        # Snapshot the history for this call, then append current frame.
+        with self._frame_history_lock:
+            prev_frames = list(self._frame_history)
+            self._frame_history.append((timestamp_sec, frame_base64))
+            if len(self._frame_history) > self.FRAME_HISTORY_SIZE:
+                self._frame_history.pop(0)
+        self.executor.submit(
+            self._process_frame, frame_base64, timestamp_sec, prev_frames
+        )
 
-    def _process_frame(self, frame_base64: str, timestamp_sec: float) -> None:
+    def _process_frame(
+        self,
+        frame_base64: str,
+        timestamp_sec: float,
+        prev_frames: List[tuple],
+    ) -> None:
         snapshot = self.state.snapshot()
         if snapshot["procedure_complete"]:
-            # Nothing useful to ask; skip the call and save cost.
             return
+
+        # Build frame labels for the prompt so the model knows the timeline.
+        frame_labels = []
+        for i, (t, _) in enumerate(prev_frames, 1):
+            frame_labels.append(f"Frame {i} (t={t:.1f}s)")
+        frame_labels.append(f"Frame {len(prev_frames)+1} / LATEST (t={timestamp_sec:.1f}s)")
+
         prompt = build_prompt(
             task_name=self.task_name,
             current_step=snapshot["current"],
             next_step=snapshot["next"],
             step_after_next=snapshot["next2"],
             last_observation=snapshot["last_observation"],
+            frame_labels=frame_labels,
         )
+        extra_images = [b64 for (_, b64) in prev_frames]
         try:
             text = call_vlm(
                 self.api_key,
@@ -438,6 +468,7 @@ class Pipeline:
                 prompt,
                 model=self.model,
                 stream=True,
+                extra_images=extra_images if extra_images else None,
             )
             with self._stats_lock:
                 self.api_calls += 1

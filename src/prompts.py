@@ -43,6 +43,7 @@ def build_prompt(
     next_step: Optional[Dict[str, Any]],
     step_after_next: Optional[Dict[str, Any]],
     last_observation: str,
+    frame_labels: Optional[List[str]] = None,
 ) -> str:
     """
     Ask the VLM a targeted question anchored at a single current step.
@@ -70,9 +71,21 @@ def build_prompt(
     )
     last_obs_str = last_observation.strip() or "none"
 
+    if frame_labels and len(frame_labels) > 1:
+        frames_note = (
+            "You are given {} images in chronological order:\n{}\n"
+            "Compare the frames to detect changes and transitions.\n"
+        ).format(
+            len(frame_labels),
+            "\n".join(f"  {lbl}" for lbl in frame_labels),
+        )
+    else:
+        frames_note = ""
+
     return (
         f"You are a real-time assistant watching a technician perform: {task_name}.\n"
         "\n"
+        f"{frames_note}"
         f"CURRENT expected step: {cur}\n"
         f"NEXT step (after current): {nxt}\n"
         f"STEP AFTER NEXT: {nxt2}\n"
